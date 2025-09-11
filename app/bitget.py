@@ -48,9 +48,12 @@ class BitgetClient:
         r.raise_for_status()
         return r.json()
 
-    def get_single_account(self, marginCoin: str = "USDT", productType: str = "USDT-FUTURES") -> Dict[str, Any]:
+    # Requires symbol + productType + marginCoin
+    def get_single_account(self, symbol: str, marginCoin: str = "USDT", productType: str = "USDT-FUTURES") -> Dict[str, Any]:
         path = "/api/v2/mix/account/account"
-        query = f"productType={productType}&marginCoin={marginCoin}"
+        q_symbol = (symbol or "").lower()
+        q_margin = (marginCoin or "USDT").lower()
+        query = f"symbol={q_symbol}&productType={productType}&marginCoin={q_margin}"
         return self._get(path, query)
 
     def place_order(
