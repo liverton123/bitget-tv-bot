@@ -33,31 +33,50 @@ class BitgetClient:
             "locale": "en-US",
         }
 
-    # ----- 잔고 조회 (모든 계정 자산)
-    def all_account_balance(self) -> Dict[str, Any]:
-        path = "/api/v2/account/all-account-balance"
+    def _get(self, path: str, query: Optional[str] = "") -> Dict[str, Any]:
         ts = self._ts()
-        sign = self._sign(ts, "GET", path)
-        r = requests.get(BITGET_API + path, headers=self._headers(ts, sign), timeout=10)
+        sign = self._sign(ts, "GET", path, query or "")
+        url = f"{BITGET_API}{path}" + (f"?{query}" if query else "")
+        r = requests.get(url, headers=self._headers(ts, sign), timeout=10)
         r.raise_for_status()
         return r.json()
 
-    # ----- 선물 단일 계정 조회 (USDT-M)
+    def _post(self, path: str, body_obj: Dict[str, Any]) -> Dict[str, Any]:
+        body = json.dumps(body_obj, separators=(",", ":"))
+        ts = self._ts()
+        sign = self._sign(ts, "POST", path, "", body)
+        r = requests.post(BITGET_API + path, headers=self._headers(ts, sign), data=body, timeout=10)
+        r.raise_for_status()
+        return r.json()
+
+    # ----- 선물 계정(USDT-M) 조회
     def get_single_account(self, marginCoin: str = "USDT", productType: str = "USDT-FUTURES") -> Dict[str, Any]:
         path = "/api/v2/mix/account/account"
         query = f"productType={productType}&marginCoin={marginCoin}"
-        ts = self._ts()
-        sign = self._sign(ts, "GET", path, query)
-        r = requests.get(f"{BITGET_API}{path}?{query}", headers=self._headers(ts, sign), timeout=10)
-        r.raise_for_status()
-        return r.json()
+        return self._get(path, query)
 
-    # ----- 주문
+    # ----- 모든 계정 잔고(총자산/가용)
+    def all_account_balance(self) -> Dict[str, Any]:
+        path = "/api/v2/account/all-account-balance"
+        return self._get(path)
+
+    # ----- (선택) 포지션 조회 - 심볼 단건
+    # Bitget의 단건 포지션 엔드포인트 명칭/쿼리는 버전 따라 다를 수 있어, 필요 시 문서 확인 후 맞추세요.
+    def get_position_single(self, symbol: str, marginCoin: str = "USDT", productType: str = "USDT-FUTURES") -> Optional[Dict[str, Any]]:
+        try:
+            path = "/api/v2/mix/position/single-position"
+            query = f"productType={productType}&marginCoin={marginCoin}&symbol={symbol}"
+            res = self._get(path, query)
+            return res
+        except Exception:
+            return None
+
+    # ----- 주문 (V2)
     def place_order(
         self,
         symbol: str,
-        side: str,       # "buy" / "sell"
-        tradeSide: str,  # "open" / "close"
+        side: str,       # "buy" or "sell"
+        tradeSide: str,  # "open" or "close"
         size: str,       # 수량(문자열)
         productType: str = "USDT-FUTURES",
         marginCoin: str = "USDT",
@@ -65,17 +84,12 @@ class BitgetClient:
     ) -> Dict[str, Any]:
         path = "/api/v2/mix/order/place-order"
         body_obj = {
-            "symbol": symbol,          # 예: "BTCUSDT"
+            "symbol": symbol,
             "productType": productType,
             "marginCoin": marginCoin,
             "side": side,              # buy/sell
             "tradeSide": tradeSide,    # open/close
             "orderType": orderType,    # market/limit
-            "size": size               # 수량(거래소 틱규칙에 맞춰 소수 자리 처리)
+            "size": size
         }
-        body = json.dumps(body_obj, separators=(",", ":"))
-        ts = self._ts()
-        sign = self._sign(ts, "POST", path, "", body)
-        r = requests.post(BITGET_API + path, headers=self._headers(ts, sign), data=body, timeout=10)
-        r.raise_for_status()
-        return r.json()
+        return self._post(path, body_obj)
