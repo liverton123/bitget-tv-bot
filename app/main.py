@@ -1,5 +1,6 @@
 import os
 from fastapi import FastAPI, Header, HTTPException
+from requests.exceptions import HTTPError
 from app.bitget import BitgetClient
 from app.models import TVSignal
 
@@ -16,21 +17,27 @@ client = BitgetClient(API_KEY, API_SECRET, API_PASSPHRASE)
 
 def map_symbol(tv_symbol: str) -> str:
     core = tv_symbol.split(":")[-1]
-    core = core.replace(".P","").replace(".perp","").replace(".PERP","")
+    core = core.replace(".P", "").replace(".perp", "").replace(".PERP", "")
     return core  # e.g. "BTCUSDT"
 
 def to_size(x: float) -> str:
     return f"{x:.6f}"
 
-def get_available_and_leverage() -> tuple[float, float]:
-    acc = client.get_single_account(marginCoin=MARGIN_COIN, productType=PRODUCT_TYPE)
+def get_available_and_leverage(symbol_core: str) -> tuple[float, float]:
+    acc = client.get_single_account(
+        symbol=symbol_core,
+        marginCoin=MARGIN_COIN,
+        productType=PRODUCT_TYPE
+    )
     data = acc.get("data", {}) if isinstance(acc, dict) else {}
     available = float(data.get("available", data.get("availableBalance", data.get("availableEquity", "0"))))
     lev = 1.0
-    if isinstance(data.get("crossedMarginLeverage", None), (int, float, str)) and str(data["crossedMarginLeverage"]).strip():
-        lev = float(data["crossedMarginLeverage"])
-    elif isinstance(data.get("isolatedLongLever", None), (int, float, str)) and str(data["isolatedLongLever"]).strip():
-        lev = float(data["isolatedLongLever"])
+    v1 = str(data.get("crossedMarginLeverage", "")).strip()
+    v2 = str(data.get("isolatedLongLever", "")).strip()
+    if v1:
+        lev = float(v1)
+    elif v2:
+        lev = float(v2)
     return available, max(lev, 1.0)
 
 def calc_qty(available_usdt: float, leverage: float, last_price: float) -> float:
@@ -45,39 +52,43 @@ def health():
 def tv_webhook(signal: TVSignal, x_token: str = Header(default="")):
     if WEBHOOK_TOKEN and x_token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
-
     if signal.side.lower() != "long":
         raise HTTPException(status_code=400, detail="Only long side is allowed")
 
-    symbol = map_symbol(signal.symbol)
+    symbol = map_symbol(signal.symbol)            # e.g. "SOONUSDT"
     last_price = float(signal.price)
 
-    if signal.action == "open":
-        available, exch_lev = get_available_and_leverage()
-        qty = calc_qty(available, exch_lev, last_price)
-        size = to_size(qty)
-        res = client.place_order(
-            symbol=symbol,
-            side="buy",
-            tradeSide="open",
-            size=size,
-            productType=PRODUCT_TYPE,
-            marginCoin=MARGIN_COIN,
-            orderType="market",
-        )
-        return {"ok": True, "did": "open-long", "symbol": symbol, "size": size, "res": res}
+    try:
+        if signal.action == "open":
+            available, exch_lev = get_available_and_leverage(symbol)
+            qty = calc_qty(available, exch_lev, last_price)
+            size = to_size(qty)
+            res = client.place_order(
+                symbol=symbol,
+                side="buy",
+                tradeSide="open",
+                size=size,
+                productType=PRODUCT_TYPE,
+                marginCoin=MARGIN_COIN,
+                orderType="market",
+            )
+            return {"ok": True, "did": "open-long", "symbol": symbol, "size": size, "res": res}
 
-    if signal.action == "close":
-        size = to_size(999999.0)  # intent: close all; exchange will reject if no position
-        res = client.place_order(
-            symbol=symbol,
-            side="sell",
-            tradeSide="close",
-            size=size,
-            productType=PRODUCT_TYPE,
-            marginCoin=MARGIN_COIN,
-            orderType="market",
-        )
-        return {"ok": True, "did": "close-long", "symbol": symbol, "res": res}
+        if signal.action == "close":
+            size = to_size(999999.0)  # intent: close long if exists
+            res = client.place_order(
+                symbol=symbol,
+                side="sell",
+                tradeSide="close",
+                size=size,
+                productType=PRODUCT_TYPE,
+                marginCoin=MARGIN_COIN,
+                orderType="market",
+            )
+            return {"ok": True, "did": "close-long", "symbol": symbol, "res": res}
 
-    raise HTTPException(status_code=400, detail=f"Unknown action: {signal.action}")
+        raise HTTPException(status_code=400, detail=f"Unknown action: {signal.action}")
+
+    except HTTPError as e:
+        # Surface Bitget error cleanly instead of 500
+        raise HTTPException(status_code=400, detail=f"Bitget HTTPError: {e}")
