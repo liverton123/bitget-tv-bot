@@ -11,7 +11,6 @@ class BitgetClient:
         self.passphrase = passphrase
 
     def _ts(self) -> str:
-        # Bitget는 밀리초 타임스탬프 문자열 사용
         return str(int(time.time() * 1000))
 
     def _sign(self, ts: str, method: str, path: str, query: str = "", body: str = "") -> str:
@@ -49,47 +48,29 @@ class BitgetClient:
         r.raise_for_status()
         return r.json()
 
-    # ----- 선물 계정(USDT-M) 조회
     def get_single_account(self, marginCoin: str = "USDT", productType: str = "USDT-FUTURES") -> Dict[str, Any]:
         path = "/api/v2/mix/account/account"
         query = f"productType={productType}&marginCoin={marginCoin}"
         return self._get(path, query)
 
-    # ----- 모든 계정 잔고(총자산/가용)
-    def all_account_balance(self) -> Dict[str, Any]:
-        path = "/api/v2/account/all-account-balance"
-        return self._get(path)
-
-    # ----- (선택) 포지션 조회 - 심볼 단건
-    # Bitget의 단건 포지션 엔드포인트 명칭/쿼리는 버전 따라 다를 수 있어, 필요 시 문서 확인 후 맞추세요.
-    def get_position_single(self, symbol: str, marginCoin: str = "USDT", productType: str = "USDT-FUTURES") -> Optional[Dict[str, Any]]:
-        try:
-            path = "/api/v2/mix/position/single-position"
-            query = f"productType={productType}&marginCoin={marginCoin}&symbol={symbol}"
-            res = self._get(path, query)
-            return res
-        except Exception:
-            return None
-
-    # ----- 주문 (V2)
     def place_order(
         self,
         symbol: str,
-        side: str,       # "buy" or "sell"
-        tradeSide: str,  # "open" or "close"
-        size: str,       # 수량(문자열)
+        side: str,
+        tradeSide: str,
+        size: str,
         productType: str = "USDT-FUTURES",
         marginCoin: str = "USDT",
-        orderType: str = "market"
+        orderType: str = "market",
     ) -> Dict[str, Any]:
         path = "/api/v2/mix/order/place-order"
         body_obj = {
             "symbol": symbol,
             "productType": productType,
             "marginCoin": marginCoin,
-            "side": side,              # buy/sell
-            "tradeSide": tradeSide,    # open/close
-            "orderType": orderType,    # market/limit
+            "side": side,           # "buy" or "sell"
+            "tradeSide": tradeSide, # "open" or "close"
+            "orderType": orderType, # "market" or "limit"
             "size": size
         }
         return self._post(path, body_obj)
