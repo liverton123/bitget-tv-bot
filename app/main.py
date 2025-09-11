@@ -5,37 +5,36 @@ from app.models import TVSignal
 
 app = FastAPI(title="TV→Bitget AutoTrader")
 
-# ----- 환경변수
 API_KEY = os.environ["BITGET_API_KEY"]
 API_SECRET = os.environ["BITGET_API_SECRET"]
 API_PASSPHRASE = os.environ["BITGET_API_PASSPHRASE"]
 WEBHOOK_TOKEN = os.environ.get("WEBHOOK_TOKEN", "")
-LEVERAGE = float(os.environ.get("LEVERAGE", "5"))               # 계정 레버리지가 우선이지만, 계산식에 사용
 PRODUCT_TYPE = os.environ.get("PRODUCT_TYPE", "USDT-FUTURES")
 MARGIN_COIN = os.environ.get("MARGIN_COIN", "USDT")
 
 client = BitgetClient(API_KEY, API_SECRET, API_PASSPHRASE)
 
 def map_symbol(tv_symbol: str) -> str:
-    """
-    TradingView 심볼 → Bitget 심볼 간단 매핑
-    예) "BINANCE:BTCUSDT.P" → "BTCUSDT"
-    """
     core = tv_symbol.split(":")[-1]
     core = core.replace(".P","").replace(".perp","").replace(".PERP","")
-    return core
+    return core  # e.g. "BTCUSDT"
 
-def round_size(size: float) -> str:
-    # 심볼별 최소수량/소수점 자릿수는 실제 스펙 조회해 맞추는 게 가장 안전
-    return f"{size:.6f}"
+def to_size(x: float) -> str:
+    return f"{x:.6f}"
 
-def get_available_usdt() -> float:
+def get_available_and_leverage() -> tuple[float, float]:
     acc = client.get_single_account(marginCoin=MARGIN_COIN, productType=PRODUCT_TYPE)
-    data = acc.get("data", {})
-    return float(data.get("available", data.get("availableBalance", data.get("availableEquity", "0"))))
+    data = acc.get("data", {}) if isinstance(acc, dict) else {}
+    available = float(data.get("available", data.get("availableBalance", data.get("availableEquity", "0"))))
+    lev = 1.0
+    if isinstance(data.get("crossedMarginLeverage", None), (int, float, str)) and str(data["crossedMarginLeverage"]).strip():
+        lev = float(data["crossedMarginLeverage"])
+    elif isinstance(data.get("isolatedLongLever", None), (int, float, str)) and str(data["isolatedLongLever"]).strip():
+        lev = float(data["isolatedLongLever"])
+    return available, max(lev, 1.0)
 
-def calc_qty(available_usdt: float, last_price: float) -> float:
-    notional = available_usdt * 0.70 * LEVERAGE
+def calc_qty(available_usdt: float, leverage: float, last_price: float) -> float:
+    notional = available_usdt * 0.70 * leverage
     return notional / max(last_price, 1e-9)
 
 @app.get("/health")
@@ -44,11 +43,9 @@ def health():
 
 @app.post("/tv")
 def tv_webhook(signal: TVSignal, x_token: str = Header(default="")):
-    # 보안 토큰 검사
     if WEBHOOK_TOKEN and x_token != WEBHOOK_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid token")
 
-    # 롱만 허용
     if signal.side.lower() != "long":
         raise HTTPException(status_code=400, detail="Only long side is allowed")
 
@@ -56,9 +53,9 @@ def tv_webhook(signal: TVSignal, x_token: str = Header(default="")):
     last_price = float(signal.price)
 
     if signal.action == "open":
-        available = get_available_usdt()
-        qty = calc_qty(available, last_price)
-        size = round_size(qty)
+        available, exch_lev = get_available_and_leverage()
+        qty = calc_qty(available, exch_lev, last_price)
+        size = to_size(qty)
         res = client.place_order(
             symbol=symbol,
             side="buy",
@@ -70,9 +67,8 @@ def tv_webhook(signal: TVSignal, x_token: str = Header(default="")):
         )
         return {"ok": True, "did": "open-long", "symbol": symbol, "size": size, "res": res}
 
-    elif signal.action == "close":
-        # MVP: 전량 청산 의도. (실전에서는 포지션 조회 후 보유수량만큼 정확히 청산하는 로직 권장)
-        size = round_size(999999.0)
+    if signal.action == "close":
+        size = to_size(999999.0)  # intent: close all; exchange will reject if no position
         res = client.place_order(
             symbol=symbol,
             side="sell",
@@ -82,4 +78,6 @@ def tv_webhook(signal: TVSignal, x_token: str = Header(default="")):
             marginCoin=MARGIN_COIN,
             orderType="market",
         )
-        return {"ok": True, "did":
+        return {"ok": True, "did": "close-long", "symbol": symbol, "res": res}
+
+    raise HTTPException(status_code=400, detail=f"Unknown action: {signal.action}")
