@@ -1,128 +1,118 @@
-# main.py
+# app/main.py
+# TV_WEBHOOK_V2  (배포 확인용 표식)
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from typing import Any, Dict, List
 import json, logging, time
 
-app = FastAPI()
+app = FastAPI(title="tv-bot", version="TVv2")
 log = logging.getLogger("uvicorn.error")
 
-# ---- idempotency: 180s window to drop duplicates
+# --- idempotency: 중복 알림 180초 차단 ---
 IDEMP_TTL = 180
 _seen: Dict[str, float] = {}
 
-def _prune_now(now: float) -> None:
-    drop = [k for k, t in _seen.items() if now - t > IDEMP_TTL]
-    for k in drop:
-        _seen.pop(k, None)
+def _prune(now: float) -> None:
+    cutoff = now - IDEMP_TTL
+    for k, t in list(_seen.items()):
+        if t < cutoff:
+            _seen.pop(k, None)
 
-def _is_dup(key: str, now: float) -> bool:
-    _prune_now(now)
+def _dup(key: str, now: float) -> bool:
+    _prune(now)
     if key in _seen:
         return True
     _seen[key] = now
     return False
 
-def _to_dict(s: str) -> Dict[str, Any]:
-    """best-effort JSON parse from string"""
-    s = s.strip()
-    return json.loads(s)
-
-def _split_multiline(body: str) -> List[str]:
-    # tolerate newline-separated JSON objects
-    parts = [p.strip() for p in body.splitlines() if p.strip()]
-    return parts if len(parts) > 1 else [body.strip()]
-
-def _normalize_keys(d: Dict[str, Any]) -> Dict[str, Any]:
-    # lower-case keys; keep original values
+def _norm(d: Dict[str, Any]) -> Dict[str, Any]:
+    # 키만 소문자화 (값은 보존)
     return { (k.lower() if isinstance(k, str) else k): v for k, v in d.items() }
 
-# ---- hook: connect to your existing trading executor here
+def _to_items(raw: str) -> List[Dict[str, Any]]:
+    """배치/단일/개행분리 포맷 모두 허용"""
+    raw = raw.strip()
+    if not raw:
+        return []
+    # 1) JSON 파싱 시도
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and isinstance(data.get("batch"), list):
+            return [_norm(x) for x in data["batch"] if isinstance(x, dict)]
+        if isinstance(data, dict):
+            return [_norm(data)]
+    except Exception:
+        pass
+    # 2) 개행 분리 포맷 허용
+    items: List[Dict[str, Any]] = []
+    for line in raw.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        items.append(_norm(json.loads(s)))
+    return items
+
+# --- 여기서 기존 매매 로직 호출만 한다. 매매법 수정 금지 ---
 def route_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
     """
-    DO NOT change your trading logic. Just call the existing functions here.
-    For example:
-        if sig["action"] == "open":
-            return trader.open_long(sig["symbol"], price=sig.get("price"))
-        elif sig["action"] == "close":
-            return trader.close_long(sig["symbol"], price=sig.get("price"))
+    예시:
+        action = sig["action"]   # "open" | "close"
+        symbol = sig["symbol"]
+        price  = sig.get("price")
+        if action == "open":
+            return trader.open_long(symbol, price=price)   # 기존 함수 호출
+        else:
+            return trader.close_long(symbol, price=price)
     """
-    # placeholder: only log
-    log.info(f"ROUTED: {sig}")
+    log.info(f"TVv2 ROUTE -> {sig}")  # 배포 확인용
     return {"ok": True}
 
+# --- 배포 확인용 헬스체크 ---
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True, "v": "TVv2"}
+
+# --- 트레이딩뷰 웹훅 (배치/단일/개행 모두 허용, 항상 200 OK) ---
 @app.post("/tv")
-async def tv(request: Request):
-    """
-    Accepts:
-      - {"action": "...", ...}
-      - {"batch":[ {...}, {...} ]}
-      - newline-separated {...}\n{...}\n...
-    Always returns 200 with per-item results (never 4xx to TV).
-    """
+async def tv(req: Request):
     try:
-        raw = (await request.body()).decode("utf-8", errors="ignore")
-        ctype = request.headers.get("content-type", "").lower()
-        log.info(f"TV webhook received. ctype={ctype!r}, size={len(raw)}")
+        raw = (await req.body()).decode("utf-8", "ignore")
+        ctype = req.headers.get("content-type", "")
+        log.info("TVv2 recv len=%d ctype=%r", len(raw), ctype)
 
-        items: List[Dict[str, Any]] = []
-
-        # 1) try JSON first (works for both object and batch)
-        parsed: Any = None
         try:
-            parsed = json.loads(raw)
+            items = _to_items(raw)
         except Exception:
-            # 2) maybe newline-separated JSONs
-            try:
-                parts = _split_multiline(raw)
-                items = [_normalize_keys(_to_dict(p)) for p in parts]
-            except Exception:
-                log.exception("TV parse failed (multiline fallback)")
-                return JSONResponse({"ok": True, "accepted": 0, "error": "parse"}, status_code=200)
+            log.exception("TVv2 parse error")
+            return JSONResponse({"ok": True, "accepted": 0, "skipped": 0, "items": 0, "err": "parse"}, status_code=200)
 
-        if parsed is not None:
-            if isinstance(parsed, dict) and "batch" in parsed and isinstance(parsed["batch"], list):
-                items = [_normalize_keys(i) for i in parsed["batch"] if isinstance(i, dict)]
-            elif isinstance(parsed, dict):
-                items = [_normalize_keys(parsed)]
-            else:
-                log.error("TV parse: unexpected root type: %s", type(parsed))
-                return JSONResponse({"ok": True, "accepted": 0, "error": "schema"}, status_code=200)
-
-        # 3) route each item
         accepted, skipped = 0, 0
         results: List[Dict[str, Any]] = []
         now = time.time()
 
         for obj in items:
-            # minimal schema check
             act = obj.get("action")
-            side = obj.get("side")
-            sym  = obj.get("symbol")
+            sym = obj.get("symbol")
             if not (isinstance(act, str) and isinstance(sym, str)):
                 skipped += 1
                 results.append({"ok": False, "reason": "missing action/symbol"})
                 continue
 
-            # idempotency key (TV often retries within seconds)
-            when = str(obj.get("time", ""))  # may be epoch or iso string
-            key  = f"{sym}|{act}|{when}"
-            if _is_dup(key, now):
+            key = f"{sym}|{act}|{str(obj.get('time',''))}"
+            if _dup(key, now):
                 results.append({"ok": True, "skipped": "duplicate"})
                 continue
 
             try:
-                res = route_signal(obj)  # <--- your existing trading code is called here
+                res = route_signal(obj)  # ← 여기서 기존 주문 함수만 호출
                 accepted += 1
                 results.append({"ok": True, "result": res})
             except Exception as e:
-                # never propagate 4xx/5xx back to TV
-                log.exception("route_signal failed for %s", obj)
+                log.exception("TVv2 route failed")
                 results.append({"ok": False, "error": str(e)})
 
-        return JSONResponse({"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results}, status_code=200)
+        return JSONResponse({"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "v": "TVv2", "results": results}, status_code=200)
 
     except Exception:
-        # protect TV from any server error loops
-        log.exception("unhandled /tv")
-        return JSONResponse({"ok": True, "accepted": 0, "error": "unhandled"}, status_code=200)
+        log.exception("TVv2 unhandled")
+        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "v": "TVv2", "err": "unhandled"}, status_code=200)
