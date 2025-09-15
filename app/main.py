@@ -20,8 +20,8 @@ IDEMP_TTL     = 180
 _seen: Dict[str, float] = {}
 
 def _now_ms() -> str:
-    # Bitget v2 서명은 초 단위 timestamp 문자열 사용
-    return str(int(time.time()))
+    # Bitget v2 requires MILLISECOND timestamp (13 digits)
+    return str(int(time.time() * 1000))
 
 def _sign(ts: str, method: str, path_q: str, body: str) -> str:
     # prehash = timestamp + method + requestPath(+query) + body
@@ -33,7 +33,7 @@ def _req(method: str, path: str, *, params: Dict[str, Any] = None, body: Dict[st
     url = BASE + path
     q = ""
     if params:
-        # Bitget는 쿼리문자열까지 서명에 포함
+        # Bitget includes the query string in the signature
         from urllib.parse import urlencode
         q = "?" + urlencode(params)
         url = url + q
@@ -101,16 +101,13 @@ def get_account_available_usdt() -> float:
     if code != 200:
         log.warning("Bitget account GET failed: %s %s", code, js)
         return 0.0
-    # v2 응답 구조 예: {"data":{"available": "...", ...}}
     data = js.get("data") or {}
-    # 일부 계정은 리스트로 내려오는 경우가 있어 보완
     if isinstance(data, list) and data:
         data = data[0]
     avail = float(data.get("available", 0) or 0)
     return max(0.0, avail)
 
 def get_contract_info(symbol_umcbl: str) -> Dict[str, Any]:
-    # 계약 스텝/정밀도 확보 (없으면 안전 기본값 사용)
     code, js = _req("GET", "/api/v2/mix/market/contracts", params={"productType": PRODUCT_TYPE})
     if code == 200 and isinstance(js.get("data"), list):
         for it in js["data"]:
@@ -142,7 +139,6 @@ def get_symbol_position_size(symbol_umcbl: str) -> float:
     size = 0.0
     for p in pos:
         if p.get("symbol") == symbol_umcbl:
-            # long position size (base size)
             sz = float(p.get("total", 0) or 0)
             size = max(size, sz)
     return size
@@ -156,7 +152,6 @@ def there_is_any_long() -> Tuple[bool, str]:
     return False, ""
 
 def place_market_buy(symbol_umcbl: str) -> Dict[str, Any]:
-    # 70% of available USDT / price -> qty (rounded to step)
     px = get_last_price(symbol_umcbl)
     if px <= 0:
         return {"ok": False, "reason": "no price"}
@@ -213,7 +208,6 @@ def route_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
     any_long, long_sym = there_is_any_long()
 
     if action == "open":
-        # 글로벌 1포지션 정책: 이미 열려있으면 무시
         if any_long:
             return {"ok": True, "skipped": f"position exists on {long_sym}"}
         return place_market_buy(symbol_umcbl)
@@ -236,7 +230,6 @@ async def tv(req: Request):
         ctype = req.headers.get("content-type", "")
         log.info("TVv2 recv len=%d ctype=%r", len(raw), ctype)
 
-        # parse
         try:
             items = _to_items(raw)
         except Exception:
