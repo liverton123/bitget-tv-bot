@@ -1,10 +1,10 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from typing import Any, Dict, List, Tuple, Optional
-import os, time, json, hmac, hashlib, base64, math, logging, requests, re
+import os, time, json, hmac, hashlib, base64, math, logging, requests
 from urllib.parse import urlencode, quote
 
-app = FastAPI(title="tv-bot", version="TVv4-bitget")
+app = FastAPI(title="tv-bot", version="TVv5-bitget")
 log = logging.getLogger("uvicorn.error")
 
 # ========= Bitget settings =========
@@ -17,19 +17,30 @@ PRODUCT_TYPE   = "USDT-FUTURES"
 MARGIN_COIN    = "USDT"
 HTTP_TIMEOUT   = 15
 
-# ========= Bot behavior =========
-USE_GLOBAL_LONG_LOCK = False
-USE_BALANCE_RATIO    = 0.70
-LEVERAGE             = float(os.getenv("LEVERAGE", "1"))
-IDEMP_TTL_SEC        = 10
-ALLOW_SPOT_FALLBACK  = True   # 선물 심볼을 못 찾으면 _SPBL로 시도
+# ========= Bot behavior (안전 기본값) =========
+USE_GLOBAL_LONG_LOCK = False        # 초기 체결 확인을 위해 OFF (원하면 True로)
+USE_BALANCE_RATIO    = 0.70         # 가용잔고 70%
+LEVERAGE             = float(os.getenv("LEVERAGE", "1"))   # 예: Render env에 LEVERAGE=3
+IDEMP_TTL_SEC        = 10           # 중복필터 10초
+ALLOW_SPOT_FALLBACK  = False        # 속도 우선(현물 폴백 비활성)
+CONTRACTS_TTL_SEC    = 600          # 선물 심볼 캐시 10분 갱신
 
 _seen: Dict[str, float] = {}
-_symbol_cache: Dict[str, str] = {}  # TV 심볼(예: OPUSDT.P) -> 최종 Bitget 심볼(예: OPUSDT_UMCBL)
 
-# ========= Time & signing =========
+# ========= Custom overrides (심볼 오버라이드 필요시 여기에 추가) =========
+# TV 심볼(예: "PENDLEUSDT.P") -> Bitget 심볼(예: "PENDLEUSDT_UMCBL")
+CUSTOM_OVERRIDES: Dict[str, str] = {
+    "PENDLEUSDT.P": "PENDLEUSDT_UMCBL",
+    # "BIOUSDT.P": "BIOUSDT_UMCBL",
+    # 필요시 계속 추가
+}
+
+# ========= Contracts cache (빠른 해석용) =========
+_contracts_set: set[str] = set()    # {"BTCUSDT_UMCBL", ...}
+_contracts_last_load: float = 0.0
+
 def now_ms() -> str:
-    return str(int(time.time() * 1000))
+    return str(int(time.time() * 1000))  # 13-digit ms
 
 def qs_canonical(params: Dict[str, Any] | None) -> str:
     if not params:
@@ -45,8 +56,7 @@ def sign_v2(ts: str, method: str, path: str, qs: str, body: str) -> str:
 
 def req(method: str, path: str, *, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None) -> Tuple[int, Dict[str, Any]]:
     qs = qs_canonical(params)
-    query_part = ("?" + qs) if qs else ""
-    url = BASE + path + query_part
+    url = BASE + path + (("?" + qs) if qs else "")
     body_str = json.dumps(body) if body else ""
     ts = now_ms()
     sig = sign_v2(ts, method, path, qs, body_str)
@@ -62,6 +72,78 @@ def req(method: str, path: str, *, params: Dict[str, Any] | None = None, body: D
         return r.status_code, r.json()
     except Exception:
         return r.status_code, {"raw": r.text}
+
+def load_contracts_if_stale(force: bool = False) -> None:
+    """USDT-M 선물 심볼 목록 캐시 (속도 우선)"""
+    global _contracts_set, _contracts_last_load
+    now = time.time()
+    if not force and _contracts_set and (now - _contracts_last_load < CONTRACTS_TTL_SEC):
+        return
+    c, j = req("GET", "/api/v2/mix/market/contracts", params={"productType": PRODUCT_TYPE})
+    fresh: set[str] = set()
+    if c == 200 and isinstance(j.get("data"), list):
+        for it in j["data"]:
+            s = it.get("symbol")
+            if isinstance(s, str):
+                fresh.add(s.upper())
+    else:
+        log.warning("contracts fetch failed: %s %s", c, j)
+    if fresh:
+        _contracts_set = fresh
+        _contracts_last_load = now
+        log.info("contracts loaded: %d symbols", len(_contracts_set))
+
+@app.on_event("startup")
+async def _warmup():
+    try:
+        load_contracts_if_stale(force=True)
+    except Exception:
+        log.exception("contracts warmup failed")
+
+# ========= Symbol resolver (초고속, HTTP 0회) =========
+def resolve_tv_symbol(tv_symbol: str) -> Optional[str]:
+    """
+    TV 심볼 -> Bitget 실제 심볼 (선물 우선).
+    순서:
+      0) CUSTOM_OVERRIDES
+      1) 캐시된 선물셋에서 _UMCBL / _DMCBL / _CMCBL O(1) 조회
+      2) 그래도 없으면 같은 prefix로 시작하는 아무 선물 심볼
+      3) (옵션) 현물 _SPBL 1회 확인 (ALLOW_SPOT_FALLBACK=True일 때)
+    """
+    load_contracts_if_stale()
+
+    key = str(tv_symbol).upper()
+    if key in CUSTOM_OVERRIDES:
+        return CUSTOM_OVERRIDES[key]
+
+    s = key.split(":")[-1]          # "BINANCE:SOLUSDT.P" -> "SOLUSDT.P"
+    if s.endswith(".P"):
+        s = s[:-2]                   # "SOLUSDT"
+    base = s
+
+    # 1) 흔한 suffix 우선
+    for suf in ("_UMCBL", "_DMCBL", "_CMCBL"):
+        cand = base + suf
+        if cand in _contracts_set:
+            return cand
+
+    # 2) 같은 베이스로 시작하는 아무 선물 심볼(드문 케이스)
+    for cand in _contracts_set:
+        if cand.startswith(base + "_"):
+            return cand
+
+    # 3) 속도 위해 기본 false (원하면 true로)
+    if ALLOW_SPOT_FALLBACK:
+        spot = base + "_SPBL"
+        c, j = req("GET", "/api/v2/mix/market/ticker", params={"symbol": spot})
+        if c == 200 and isinstance(j.get("data"), dict):
+            try:
+                if float(j["data"].get("last", 0) or 0) > 0:
+                    return spot
+            except Exception:
+                pass
+
+    return None
 
 # ========= Utils =========
 def norm_keys(d: Dict[str, Any]) -> Dict[str, Any]:
@@ -96,81 +178,8 @@ def is_dup(key: str, now_t: float) -> bool:
     _seen[key] = now_t
     return False
 
-# ========= Contracts helpers =========
-def list_futures_contracts() -> List[Dict[str, Any]]:
-    c, j = req("GET", "/api/v2/mix/market/contracts", params={"productType": PRODUCT_TYPE})
-    if c == 200 and isinstance(j.get("data"), list):
-        return j["data"]
-    log.warning("contracts fetch failed: %s %s", c, j)
-    return []
-
-def resolve_symbol_from_contracts(base_pair: str) -> Optional[str]:
-    """
-    base_pair: 'OPUSDT' 같은 기본 페어(거래소 prefix/ .P 제거 후)
-    1) 흔한 suffix 조합 우선 시도: _UMCBL, _DMCBL, _CMCBL
-    2) contracts 목록에서 'OPUSDT_' 로 시작하는 첫 심볼 탐색
-    3) (옵션) spot fallback: _SPBL
-    """
-    # 1) 우선 시도
-    candidates = [f"{base_pair}_UMCBL", f"{base_pair}_DMCBL", f"{base_pair}_CMCBL"]
-    for sym in candidates:
-        if has_ticker(sym):
-            return sym
-
-    # 2) contracts에서 유사 매칭
-    contracts = list_futures_contracts()
-    wanted_prefix = f"{base_pair}_"
-    for it in contracts:
-        s = it.get("symbol", "")
-        if isinstance(s, str) and s.upper().startswith(wanted_prefix):
-            return s
-
-    # 3) spot fallback
-    if ALLOW_SPOT_FALLBACK:
-        spot = f"{base_pair}_SPBL"
-        if has_ticker(spot):
-            return spot
-
-    return None
-
-def has_ticker(symbol: str) -> bool:
-    c, j = req("GET", "/api/v2/mix/market/ticker", params={"symbol": symbol})
-    if c == 200 and isinstance(j.get("data"), dict):
-        try:
-            px = float(j["data"].get("last", 0) or 0)
-            return px > 0
-        except Exception:
-            return False
-    return False
-
-def resolve_tv_symbol(tv_symbol: str) -> Optional[str]:
-    """
-    TV 심볼을 받아 Bitget 실제 심볼로 변환한다.
-    캐시 -> 규칙 -> contracts 탐색 순서.
-    """
-    key = str(tv_symbol).upper()
-    if key in _symbol_cache:
-        return _symbol_cache[key]
-
-    s = key.split(":")[-1]  # "BINANCE:OPUSDT.P" -> "OPUSDT.P"
-    if s.endswith(".P"):    # perpetual 표기 제거
-        s = s[:-2]
-    base_pair = s  # "OPUSDT"
-
-    # 1차: 규칙 기반 후보 (UMCBL)
-    candidate = f"{base_pair}_UMCBL"
-    if has_ticker(candidate):
-        _symbol_cache[key] = candidate
-        return candidate
-
-    # 2차: contracts에서 동적 해석(다른 suffix 포함)
-    dyn = resolve_symbol_from_contracts(base_pair)
-    if dyn:
-        _symbol_cache[key] = dyn
-        return dyn
-
-    # 못 찾으면 None
-    return None
+def round_down(x: float, step: float) -> float:
+    return math.floor(x / step) * step if step > 0 else x
 
 # ========= Bitget helpers =========
 def get_account_available() -> float:
@@ -300,7 +309,6 @@ def route_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
     if not act or not sym_tv:
         return {"ok": False, "reason": "missing fields"}
 
-    # TV 심볼 → Bitget 심볼 동적 해석
     symbol = resolve_tv_symbol(sym_tv)
     if not symbol:
         msg = f"symbol resolve failed for {sym_tv}"
@@ -323,7 +331,7 @@ def route_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
 # ========= Health =========
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "v": "TVv4-bitget"}
+    return {"ok": True, "v": "TVv5-bitget"}
 
 # ========= TradingView webhook =========
 @app.post("/tv")
@@ -331,7 +339,7 @@ async def tv(req: Request):
     try:
         raw = (await req.body()).decode("utf-8", "ignore")
         ctype = req.headers.get("content-type", "")
-        log.info("TVv4 recv len=%d ctype=%r", len(raw), ctype)
+        log.info("TVv5 recv len=%d ctype=%r", len(raw), ctype)
 
         items = parse_tv_payload(raw)
         accepted, skipped = 0, 0
@@ -339,7 +347,7 @@ async def tv(req: Request):
         now_t = time.time()
 
         for obj in items:
-            log.info("TVv4 ROUTE -> %r", obj)
+            log.info("TVv5 ROUTE -> %r", obj)
             act = obj.get("action")
             sym = obj.get("symbol")
             if not isinstance(act, str) or not isinstance(sym, str):
@@ -350,12 +358,12 @@ async def tv(req: Request):
             key = f"{sym}|{act}|{str(obj.get('time',''))}"
             if is_dup(key, now_t):
                 res = {"ok": True, "skipped": "duplicate"}
-                log.info("TVv4 RESULT -> %r", res)
+                log.info("TVv5 RESULT -> %r", res)
                 results.append(res)
                 continue
 
             res = route_signal(obj)
-            log.info("TVv4 RESULT -> %r", res)
+            log.info("TVv5 RESULT -> %r", res)
             if res.get("ok"):
                 accepted += 1
             else:
@@ -363,9 +371,9 @@ async def tv(req: Request):
             results.append(res)
 
         return JSONResponse(
-            {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv4-bitget"},
+            {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv5-bitget"},
             status_code=200,
         )
     except Exception:
         log.exception("unhandled /tv")
-        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv4-bitget"}, status_code=200)
+        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv5-bitget"}, status_code=200)
