@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Tuple
 import os, time, json, hmac, hashlib, base64, math, logging, requests
 from urllib.parse import urlencode, quote
 
-app = FastAPI(title="tv-bot", version="TVv2-bitget")
+app = FastAPI(title="tv-bot", version="TVv3-bitget")
 log = logging.getLogger("uvicorn.error")
 
 # ========= Bitget settings =========
@@ -17,30 +17,33 @@ PRODUCT_TYPE   = "USDT-FUTURES"
 MARGIN_COIN    = "USDT"
 HTTP_TIMEOUT   = 15
 
-# ========= Bot behavior (안전 기본값) =========
-USE_GLOBAL_LONG_LOCK = False   # 임시 OFF (원인 파악/초기 체결 확인을 위해). 필요시 True로.
-USE_BALANCE_RATIO    = 0.70    # 가용잔고 70% 사용
-LEVERAGE             = float(os.getenv("LEVERAGE", "1"))  # 레버리지 반영(원하면 Render env에 LEVERAGE=3)
-IDEMP_TTL_SEC        = 10      # 중복 필터 10초(테스트 편의). 운영시 늘려도 됨.
+# ========= Bot behavior =========
+USE_GLOBAL_LONG_LOCK = False
+USE_BALANCE_RATIO    = 0.70
+LEVERAGE             = float(os.getenv("LEVERAGE", "1"))
+IDEMP_TTL_SEC        = 10
 
 _seen: Dict[str, float] = {}
 
+# ========= Custom symbol mapping =========
+CUSTOM_SYMBOL_MAP = {
+    # 정확한 심볼명으로 교체 (Bitget API contracts에서 확인)
+    "BIOUSDT.P": "BIOUSDT_UMCBL",
+    "SOLUSDT.P": "SOLUSDT_UMCBL",
+    "BTCUSDT.P": "BTCUSDT_UMCBL",
+}
+
 # ========= Time & signing =========
 def now_ms() -> str:
-    return str(int(time.time() * 1000))   # 13-digit ms
+    return str(int(time.time() * 1000))
 
 def qs_canonical(params: Dict[str, Any] | None) -> str:
-    """key ASC, RFC3986 encoding, no leading '?'."""
     if not params:
         return ""
     items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
     return urlencode(items, quote_via=quote, safe="")
 
 def sign_v2(ts: str, method: str, path: str, qs: str, body: str) -> str:
-    """
-    prehash = timestamp + method + requestPath + queryString + body
-    NOTE: queryString MUST include leading '?' if present.
-    """
     query_part = ("?" + qs) if qs else ""
     prehash = f"{ts}{method.upper()}{path}{query_part}{body}"
     sig = hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()
@@ -71,11 +74,6 @@ def norm_keys(d: Dict[str, Any]) -> Dict[str, Any]:
     return {(k.lower() if isinstance(k, str) else k): v for k, v in d.items()}
 
 def parse_tv_payload(raw: str) -> List[Dict[str, Any]]:
-    """
-    Accept:
-      {"batch":[{...},{...}]}  or  single object  or  newline separated objects
-    Returns list of dicts (lower-cased keys).
-    """
     raw = raw.strip()
     if not raw:
         return []
@@ -96,7 +94,6 @@ def parse_tv_payload(raw: str) -> List[Dict[str, Any]]:
 
 def is_dup(key: str, now_t: float) -> bool:
     cutoff = now_t - IDEMP_TTL_SEC
-    # purge
     for k, t in list(_seen.items()):
         if t < cutoff:
             _seen.pop(k, None)
@@ -106,16 +103,8 @@ def is_dup(key: str, now_t: float) -> bool:
     return False
 
 def tv_symbol_to_umcbl(tv_symbol: str) -> str:
-    """
-    "BINANCE:SOLUSDT.P" -> "SOLUSDT_UMCBL"
-    - 거래소 prefix 제거
-    - .P 제거
-    - 대문자 통일
-    """
     s = str(tv_symbol).split(":")[-1].upper()
-    if s.endswith(".P"):
-        s = s[:-2]
-    return f"{s}_UMCBL"
+    return CUSTOM_SYMBOL_MAP.get(s, s.replace(".P", "") + "_UMCBL")
 
 def round_down(x: float, step: float) -> float:
     return math.floor(x / step) * step if step > 0 else x
@@ -200,7 +189,6 @@ def place_buy(symbol: str) -> Dict[str, Any]:
     except Exception:
         step = 0.001
 
-    # 레버리지 반영(옵션) + 라운딩
     use = avail * USE_BALANCE_RATIO
     notional = use * max(1.0, LEVERAGE)
     qty = round_down(notional / px, step)
@@ -267,7 +255,7 @@ def route_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
 # ========= Health =========
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "v": "TVv2-bitget"}
+    return {"ok": True, "v": "TVv3-bitget"}
 
 # ========= TradingView webhook =========
 @app.post("/tv")
@@ -275,15 +263,15 @@ async def tv(req: Request):
     try:
         raw = (await req.body()).decode("utf-8", "ignore")
         ctype = req.headers.get("content-type", "")
-        log.info("TVv2 recv len=%d ctype=%r", len(raw), ctype)
+        log.info("TVv3 recv len=%d ctype=%r", len(raw), ctype)
 
-        items = parse_tv_payload(raw)  # keeps order
+        items = parse_tv_payload(raw)
         accepted, skipped = 0, 0
         results: List[Dict[str, Any]] = []
         now_t = time.time()
 
         for obj in items:
-            log.info("TVv2 ROUTE -> %r", obj)
+            log.info("TVv3 ROUTE -> %r", obj)
             act = obj.get("action")
             sym = obj.get("symbol")
             if not isinstance(act, str) or not isinstance(sym, str):
@@ -291,26 +279,25 @@ async def tv(req: Request):
                 results.append({"ok": False, "reason": "invalid object"})
                 continue
 
-            # idempotency key: symbol|action|time
             key = f"{sym}|{act}|{str(obj.get('time',''))}"
             if is_dup(key, now_t):
-                results.append({"ok": True, "skipped": "duplicate"})
-                log.info("TVv2 RESULT -> %r", results[-1])
+                res = {"ok": True, "skipped": "duplicate"}
+                log.info("TVv3 RESULT -> %r", res)
+                results.append(res)
                 continue
 
             res = route_signal(obj)
-            log.info("TVv2 RESULT -> %r", res)   # 결과/스킵 사유 항상 출력
+            log.info("TVv3 RESULT -> %r", res)
             if res.get("ok"):
                 accepted += 1
             else:
                 skipped += 1
             results.append(res)
 
-        # Always 200 back to TV
         return JSONResponse(
-            {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv2-bitget"},
+            {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv3-bitget"},
             status_code=200,
         )
     except Exception:
         log.exception("unhandled /tv")
-        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv2-bitget"}, status_code=200)
+        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv3-bitget"}, status_code=200)
