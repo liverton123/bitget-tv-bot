@@ -17,22 +17,20 @@ PRODUCT_TYPE   = "USDT-FUTURES"
 MARGIN_COIN    = "USDT"
 HTTP_TIMEOUT   = 15
 
-# One-position lock (only one long across all symbols)
-USE_GLOBAL_LONG_LOCK = True
-# Use 70% of available balance for entry
-USE_BALANCE_RATIO = 0.70
+# ========= Bot behavior (안전 기본값) =========
+USE_GLOBAL_LONG_LOCK = False   # 임시 OFF (원인 파악/초기 체결 확인을 위해). 필요시 True로.
+USE_BALANCE_RATIO    = 0.70    # 가용잔고 70% 사용
+LEVERAGE             = float(os.getenv("LEVERAGE", "1"))  # 레버리지 반영(원하면 Render env에 LEVERAGE=3)
+IDEMP_TTL_SEC        = 10      # 중복 필터 10초(테스트 편의). 운영시 늘려도 됨.
 
-# Idempotency (deduplicate same (symbol, action, time) within TTL)
-IDEMP_TTL_SEC = 180
 _seen: Dict[str, float] = {}
 
 # ========= Time & signing =========
 def now_ms() -> str:
-    # Bitget v2 requires 13-digit millisecond timestamp
-    return str(int(time.time() * 1000))
+    return str(int(time.time() * 1000))   # 13-digit ms
 
 def qs_canonical(params: Dict[str, Any] | None) -> str:
-    """Bitget v2 canonical query: key ASC, RFC3986 encoding, no leading '?'."""
+    """key ASC, RFC3986 encoding, no leading '?'."""
     if not params:
         return ""
     items = sorted((k, "" if v is None else str(v)) for k, v in params.items())
@@ -40,9 +38,8 @@ def qs_canonical(params: Dict[str, Any] | None) -> str:
 
 def sign_v2(ts: str, method: str, path: str, qs: str, body: str) -> str:
     """
-    Bitget v2 prehash:
-      prehash = timestamp + method + requestPath + queryString + body
-    NOTE: queryString MUST include the leading '?' if it exists.
+    prehash = timestamp + method + requestPath + queryString + body
+    NOTE: queryString MUST include leading '?' if present.
     """
     query_part = ("?" + qs) if qs else ""
     prehash = f"{ts}{method.upper()}{path}{query_part}{body}"
@@ -77,7 +74,7 @@ def parse_tv_payload(raw: str) -> List[Dict[str, Any]]:
     """
     Accept:
       {"batch":[{...},{...}]}  or  single object  or  newline separated objects
-    Returns a list of dicts with lower-cased keys.
+    Returns list of dicts (lower-cased keys).
     """
     raw = raw.strip()
     if not raw:
@@ -99,7 +96,8 @@ def parse_tv_payload(raw: str) -> List[Dict[str, Any]]:
 
 def is_dup(key: str, now_t: float) -> bool:
     cutoff = now_t - IDEMP_TTL_SEC
-    for k, t in list(_seen.items()):  # purge old
+    # purge
+    for k, t in list(_seen.items()):
         if t < cutoff:
             _seen.pop(k, None)
     if key in _seen:
@@ -108,8 +106,16 @@ def is_dup(key: str, now_t: float) -> bool:
     return False
 
 def tv_symbol_to_umcbl(tv_symbol: str) -> str:
-    # TradingView synthetic: e.g., BANANAUSDT.P  -> BANANAUSDT_UMCBL (Bitget USDT-M perp)
-    return tv_symbol.replace(".P", "") + "_UMCBL"
+    """
+    "BINANCE:SOLUSDT.P" -> "SOLUSDT_UMCBL"
+    - 거래소 prefix 제거
+    - .P 제거
+    - 대문자 통일
+    """
+    s = str(tv_symbol).split(":")[-1].upper()
+    if s.endswith(".P"):
+        s = s[:-2]
+    return f"{s}_UMCBL"
 
 def round_down(x: float, step: float) -> float:
     return math.floor(x / step) * step if step > 0 else x
@@ -179,9 +185,12 @@ def any_long_open() -> Tuple[bool, str]:
 def place_buy(symbol: str) -> Dict[str, Any]:
     px = get_last_price(symbol)
     if px <= 0:
+        log.warning("BUY skipped: no price for %s", symbol)
         return {"ok": False, "reason": "no price"}
+
     avail = get_account_available()
     if avail <= 0:
+        log.warning("BUY skipped: no balance (avail=%s)", avail)
         return {"ok": False, "reason": "no balance"}
 
     cinfo = get_contract(symbol)
@@ -191,10 +200,14 @@ def place_buy(symbol: str) -> Dict[str, Any]:
     except Exception:
         step = 0.001
 
+    # 레버리지 반영(옵션) + 라운딩
     use = avail * USE_BALANCE_RATIO
-    qty = round_down(use / px, step)
+    notional = use * max(1.0, LEVERAGE)
+    qty = round_down(notional / px, step)
     if qty <= 0:
-        return {"ok": False, "reason": "qty<=0", "calc": {"avail": avail, "use": use, "px": px, "step": step}}
+        calc = {"avail": avail, "use": use, "lev": LEVERAGE, "px": px, "step": step}
+        log.warning("BUY skipped: qty<=0 calc=%r", calc)
+        return {"ok": False, "reason": "qty<=0", "calc": calc}
 
     body = {
         "symbol": symbol,
@@ -213,6 +226,7 @@ def place_buy(symbol: str) -> Dict[str, Any]:
 def place_close(symbol: str) -> Dict[str, Any]:
     qty = get_pos_size(symbol)
     if qty <= 0:
+        log.info("CLOSE skipped: no position for %s", symbol)
         return {"ok": True, "skipped": "no position"}
     body = {
         "symbol": symbol,
@@ -234,12 +248,15 @@ def route_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
     sym_tv = sig.get("symbol") or ""
     if not act or not sym_tv:
         return {"ok": False, "reason": "missing fields"}
+
     symbol = tv_symbol_to_umcbl(sym_tv)
 
     if act == "open":
         locked, locked_sym = any_long_open()
         if locked:
-            return {"ok": True, "skipped": f"already long {locked_sym}"}
+            msg = f"already long {locked_sym}"
+            log.info("OPEN skipped: %s", msg)
+            return {"ok": True, "skipped": msg}
         return place_buy(symbol)
 
     if act == "close":
@@ -260,7 +277,7 @@ async def tv(req: Request):
         ctype = req.headers.get("content-type", "")
         log.info("TVv2 recv len=%d ctype=%r", len(raw), ctype)
 
-        items = parse_tv_payload(raw)  # keeps batch order
+        items = parse_tv_payload(raw)  # keeps order
         accepted, skipped = 0, 0
         results: List[Dict[str, Any]] = []
         now_t = time.time()
@@ -274,20 +291,22 @@ async def tv(req: Request):
                 results.append({"ok": False, "reason": "invalid object"})
                 continue
 
-            # idempotency key: symbol|action|time (string)
+            # idempotency key: symbol|action|time
             key = f"{sym}|{act}|{str(obj.get('time',''))}"
             if is_dup(key, now_t):
                 results.append({"ok": True, "skipped": "duplicate"})
+                log.info("TVv2 RESULT -> %r", results[-1])
                 continue
 
             res = route_signal(obj)
+            log.info("TVv2 RESULT -> %r", res)   # 결과/스킵 사유 항상 출력
             if res.get("ok"):
                 accepted += 1
             else:
                 skipped += 1
             results.append(res)
 
-        # Always 200 back to TradingView to avoid alert suppression
+        # Always 200 back to TV
         return JSONResponse(
             {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv2-bitget"},
             status_code=200,
