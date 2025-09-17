@@ -1,4 +1,3 @@
-# app/main.py
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from typing import Any, Dict, List, Tuple
@@ -285,4 +284,14 @@ async def tv(req: Request):
             if res.get("ok"):
                 accepted += 1
             else:
-                skipped
+                skipped += 1
+            results.append(res)
+
+        # Always 200 back to TradingView to avoid alert suppression
+        return JSONResponse(
+            {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv2-bitget"},
+            status_code=200,
+        )
+    except Exception:
+        log.exception("unhandled /tv")
+        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv2-bitget"}, status_code=200)
