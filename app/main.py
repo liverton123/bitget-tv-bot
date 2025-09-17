@@ -41,16 +41,19 @@ def qs_canonical(params: Dict[str, Any] | None) -> str:
 
 def sign_v2(ts: str, method: str, path: str, qs: str, body: str) -> str:
     """
-    prehash = timestamp + method + requestPath + queryString + body
-              (queryString is concatenated WITHOUT '?')
+    Bitget v2 prehash:
+      prehash = timestamp + method + requestPath + queryString + body
+    NOTE: queryString MUST include the leading '?' if it exists.
     """
-    prehash = f"{ts}{method.upper()}{path}{qs}{body}"
+    query_part = ("?" + qs) if qs else ""
+    prehash = f"{ts}{method.upper()}{path}{query_part}{body}"
     sig = hmac.new(API_SECRET.encode(), prehash.encode(), hashlib.sha256).digest()
     return base64.b64encode(sig).decode()
 
 def req(method: str, path: str, *, params: Dict[str, Any] | None = None, body: Dict[str, Any] | None = None) -> Tuple[int, Dict[str, Any]]:
     qs = qs_canonical(params)
-    url = BASE + path + (("?" + qs) if qs else "")
+    query_part = ("?" + qs) if qs else ""
+    url = BASE + path + query_part
     body_str = json.dumps(body) if body else ""
     ts = now_ms()
     sig = sign_v2(ts, method, path, qs, body_str)
@@ -97,7 +100,7 @@ def parse_tv_payload(raw: str) -> List[Dict[str, Any]]:
 
 def is_dup(key: str, now_t: float) -> bool:
     cutoff = now_t - IDEMP_TTL_SEC
-    for k, t in list(_seen.items()):
+    for k, t in list(_seen.items()):  # purge old
         if t < cutoff:
             _seen.pop(k, None)
     if key in _seen:
@@ -282,14 +285,4 @@ async def tv(req: Request):
             if res.get("ok"):
                 accepted += 1
             else:
-                skipped += 1
-            results.append(res)
-
-        # Always 200 back to TradingView to avoid alert suppression
-        return JSONResponse(
-            {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv2-bitget"},
-            status_code=200,
-        )
-    except Exception:
-        log.exception("unhandled /tv")
-        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv2-bitget"}, status_code=200)
+                skipped
