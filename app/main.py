@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Tuple, Optional
 import os, time, json, hmac, hashlib, base64, math, logging, requests
 from urllib.parse import urlencode, quote
 
-app = FastAPI(title="tv-bot", version="TVv5-bitget")
+app = FastAPI(title="tv-bot", version="TVv5.1-bitget")
 log = logging.getLogger("uvicorn.error")
 
 # ========= Bitget settings =========
@@ -17,28 +17,29 @@ PRODUCT_TYPE   = "USDT-FUTURES"
 MARGIN_COIN    = "USDT"
 HTTP_TIMEOUT   = 15
 
-# ========= Bot behavior (안전 기본값) =========
-USE_GLOBAL_LONG_LOCK = False        # 초기 체결 확인을 위해 OFF (원하면 True로)
-USE_BALANCE_RATIO    = 0.70         # 가용잔고 70%
-LEVERAGE             = float(os.getenv("LEVERAGE", "1"))   # 예: Render env에 LEVERAGE=3
-IDEMP_TTL_SEC        = 10           # 중복필터 10초
-ALLOW_SPOT_FALLBACK  = False        # 속도 우선(현물 폴백 비활성)
-CONTRACTS_TTL_SEC    = 600          # 선물 심볼 캐시 10분 갱신
+# ========= Bot behavior =========
+USE_GLOBAL_LONG_LOCK = False            # 초기엔 OFF (원하면 True)
+USE_BALANCE_RATIO    = 0.70
+LEVERAGE             = float(os.getenv("LEVERAGE", "1"))  # Render env에 LEVERAGE=3 등
+IDEMP_TTL_SEC        = 10
+ALLOW_SPOT_FALLBACK  = False            # 속도 우선
+CONTRACTS_TTL_SEC    = 600              # 선물 심볼 캐시 주기
 
 _seen: Dict[str, float] = {}
 
-# ========= Custom overrides (심볼 오버라이드 필요시 여기에 추가) =========
-# TV 심볼(예: "PENDLEUSDT.P") -> Bitget 심볼(예: "PENDLEUSDT_UMCBL")
+# ========= Custom overrides (필요 종목만 예외 매핑) =========
+# TV 심볼 → Bitget 심볼
 CUSTOM_OVERRIDES: Dict[str, str] = {
-    "PENDLEUSDT.P": "PENDLEUSDT_UMCBL",
+    "PENDLEUSDT.P": "PENDLEUSDT_UMCBL",   # 필요시 정확 심볼명을 넣어 사용
     # "BIOUSDT.P": "BIOUSDT_UMCBL",
-    # 필요시 계속 추가
+    # "DOGEUSDT.P": "DOGEUSDT_UMCBL",
 }
 
-# ========= Contracts cache (빠른 해석용) =========
-_contracts_set: set[str] = set()    # {"BTCUSDT_UMCBL", ...}
+# ========= Contracts cache (빠른 해석) =========
+_contracts_set: set[str] = set()    # e.g. {"BTCUSDT_UMCBL", ...}
 _contracts_last_load: float = 0.0
 
+# ========= Basic HTTP helpers =========
 def now_ms() -> str:
     return str(int(time.time() * 1000))  # 13-digit ms
 
@@ -73,8 +74,8 @@ def req(method: str, path: str, *, params: Dict[str, Any] | None = None, body: D
     except Exception:
         return r.status_code, {"raw": r.text}
 
+# ========= Contracts cache loader =========
 def load_contracts_if_stale(force: bool = False) -> None:
-    """USDT-M 선물 심볼 목록 캐시 (속도 우선)"""
     global _contracts_set, _contracts_last_load
     now = time.time()
     if not force and _contracts_set and (now - _contracts_last_load < CONTRACTS_TTL_SEC):
@@ -100,49 +101,57 @@ async def _warmup():
     except Exception:
         log.exception("contracts warmup failed")
 
-# ========= Symbol resolver (초고속, HTTP 0회) =========
+# ========= Symbol resolver (강화 로그) =========
 def resolve_tv_symbol(tv_symbol: str) -> Optional[str]:
     """
     TV 심볼 -> Bitget 실제 심볼 (선물 우선).
     순서:
       0) CUSTOM_OVERRIDES
-      1) 캐시된 선물셋에서 _UMCBL / _DMCBL / _CMCBL O(1) 조회
-      2) 그래도 없으면 같은 prefix로 시작하는 아무 선물 심볼
-      3) (옵션) 현물 _SPBL 1회 확인 (ALLOW_SPOT_FALLBACK=True일 때)
+      1) 캐시된 선물셋에서 _UMCBL/_DMCBL/_CMCBL 조회
+      2) 같은 prefix로 시작하는 임의 선물 심볼
+      3) (옵션) 현물 _SPBL 조회
+    실패 시, 어떤 후보를 시도했고 캐시 상태가 어떤지 로그를 남긴다.
     """
     load_contracts_if_stale()
 
     key = str(tv_symbol).upper()
     if key in CUSTOM_OVERRIDES:
-        return CUSTOM_OVERRIDES[key]
+        res = CUSTOM_OVERRIDES[key]
+        log.info("resolver override %s -> %s", key, res)
+        return res
 
-    s = key.split(":")[-1]          # "BINANCE:SOLUSDT.P" -> "SOLUSDT.P"
-    if s.endswith(".P"):
-        s = s[:-2]                   # "SOLUSDT"
-    base = s
+    sym = key.split(":")[-1]      # "BINANCE:DOGEUSDT.P" -> "DOGEUSDT.P"
+    if sym.endswith(".P"):
+        sym = sym[:-2]            # "DOGEUSDT"
+    base = sym
 
-    # 1) 흔한 suffix 우선
+    tried = []
     for suf in ("_UMCBL", "_DMCBL", "_CMCBL"):
         cand = base + suf
+        tried.append(cand)
         if cand in _contracts_set:
             return cand
 
-    # 2) 같은 베이스로 시작하는 아무 선물 심볼(드문 케이스)
-    for cand in _contracts_set:
-        if cand.startswith(base + "_"):
-            return cand
+    # 같은 prefix로 시작하는 선물 심볼 찾기 (드문 케이스)
+    matches = [c for c in _contracts_set if c.startswith(base + "_")]
+    if matches:
+        log.warning("resolver fallback matches for %s -> %s", tv_symbol, matches[:3])
+        return matches[0]
 
-    # 3) 속도 위해 기본 false (원하면 true로)
+    # 현물 폴백(기본 비활성)
     if ALLOW_SPOT_FALLBACK:
         spot = base + "_SPBL"
         c, j = req("GET", "/api/v2/mix/market/ticker", params={"symbol": spot})
         if c == 200 and isinstance(j.get("data"), dict):
             try:
                 if float(j["data"].get("last", 0) or 0) > 0:
+                    log.warning("resolver spot fallback %s -> %s", tv_symbol, spot)
                     return spot
             except Exception:
                 pass
 
+    log.warning("symbol resolve failed for %s (tried=%s, contracts_loaded=%d)",
+                tv_symbol, tried, len(_contracts_set))
     return None
 
 # ========= Utils =========
@@ -331,7 +340,7 @@ def route_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
 # ========= Health =========
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "v": "TVv5-bitget"}
+    return {"ok": True, "v": "TVv5.1-bitget"}
 
 # ========= TradingView webhook =========
 @app.post("/tv")
@@ -339,7 +348,7 @@ async def tv(req: Request):
     try:
         raw = (await req.body()).decode("utf-8", "ignore")
         ctype = req.headers.get("content-type", "")
-        log.info("TVv5 recv len=%d ctype=%r", len(raw), ctype)
+        log.info("TVv5.1 recv len=%d ctype=%r", len(raw), ctype)
 
         items = parse_tv_payload(raw)
         accepted, skipped = 0, 0
@@ -347,7 +356,7 @@ async def tv(req: Request):
         now_t = time.time()
 
         for obj in items:
-            log.info("TVv5 ROUTE -> %r", obj)
+            log.info("TVv5.1 ROUTE -> %r", obj)
             act = obj.get("action")
             sym = obj.get("symbol")
             if not isinstance(act, str) or not isinstance(sym, str):
@@ -358,12 +367,12 @@ async def tv(req: Request):
             key = f"{sym}|{act}|{str(obj.get('time',''))}"
             if is_dup(key, now_t):
                 res = {"ok": True, "skipped": "duplicate"}
-                log.info("TVv5 RESULT -> %r", res)
+                log.info("TVv5.1 RESULT -> %r", res)
                 results.append(res)
                 continue
 
             res = route_signal(obj)
-            log.info("TVv5 RESULT -> %r", res)
+            log.info("TVv5.1 RESULT -> %r", res)
             if res.get("ok"):
                 accepted += 1
             else:
@@ -371,9 +380,9 @@ async def tv(req: Request):
             results.append(res)
 
         return JSONResponse(
-            {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv5-bitget"},
+            {"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv5.1-bitget"},
             status_code=200,
         )
     except Exception:
         log.exception("unhandled /tv")
-        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv5-bitget"}, status_code=200)
+        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv5.1-bitget"}, status_code=200)
