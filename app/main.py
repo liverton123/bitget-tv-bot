@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Tuple, Optional
 import os, time, json, hmac, hashlib, base64, math, logging, requests
 from urllib.parse import urlencode, quote
 
-app = FastAPI(title="tv-bot", version="TVv7-bitget")
+app = FastAPI(title="tv-bot", version="TVv7.2-bitget")
 log = logging.getLogger("uvicorn.error")
 
 # ========= Bitget settings =========
@@ -17,17 +17,18 @@ PRODUCT_TYPE   = "USDT-FUTURES"
 MARGIN_COIN    = "USDT"
 HTTP_TIMEOUT   = 15
 
-# ========= Bot behavior (기존 유지) =========
+# ========= Bot behavior =========
 USE_GLOBAL_LONG_LOCK = False
 USE_BALANCE_RATIO    = 0.70
 LEVERAGE             = float(os.getenv("LEVERAGE", "1"))
 IDEMP_TTL_SEC        = 10
+ALLOW_SPOT_FALLBACK  = False        # 필요시 True
 
 _seen: Dict[str, float] = {}
 
 # ========= HTTP helpers =========
 def now_ms() -> str:
-    return str(int(time.time() * 1000))  # 13-digit ms
+    return str(int(time.time() * 1000))
 
 def qs_canonical(params: Dict[str, Any] | None) -> str:
     if not params:
@@ -60,36 +61,48 @@ def req(method: str, path: str, *, params: Dict[str, Any] | None = None, body: D
     except Exception:
         return r.status_code, {"raw": r.text}
 
-# ========= Symbol index (핵심) =========
-# Bitget 선물 목록을 인덱싱: "AAVEUSDT" -> "AAVEUSDT_UMCBL"
+# ========= Contracts index (with retry) =========
 _contracts_index: Dict[str, str] = {}
 _contracts_last_load: float = 0.0
-CONTRACTS_TTL_SEC = 600  # 10분마다 갱신
+CONTRACTS_TTL_SEC = 600
+
+def _try_build_index_once() -> Optional[Dict[str, str]]:
+    c, j = req("GET", "/api/v2/mix/market/contracts", params={"productType": PRODUCT_TYPE})
+    if c != 200:
+        log.warning("contracts fetch failed: code=%s body=%s", c, j)
+        return None
+    data = j.get("data")
+    if not isinstance(data, list) or not data:
+        log.warning("contracts empty or unexpected payload: %s", str(j)[:200])
+        return None
+    idx: Dict[str, str] = {}
+    for it in data:
+        sym = str(it.get("symbol", "")).upper()   # e.g. BTCUSDT_UMCBL
+        if "_" not in sym:
+            continue
+        base = sym.split("_", 1)[0]               # BTCUSDT
+        if base not in idx or sym.endswith("_UMCBL"):
+            idx[base] = sym
+    return idx
 
 def build_contracts_index(force: bool = False) -> None:
     global _contracts_index, _contracts_last_load
     now = time.time()
     if not force and _contracts_index and (now - _contracts_last_load < CONTRACTS_TTL_SEC):
         return
-    c, j = req("GET", "/api/v2/mix/market/contracts", params={"productType": PRODUCT_TYPE})
-    new_index: Dict[str, str] = {}
-    if c == 200 and isinstance(j.get("data"), list):
-        for it in j["data"]:
-            sym = str(it.get("symbol", "")).upper()            # e.g., "AAVEUSDT_UMCBL"
-            if "_" in sym:
-                base = sym.split("_", 1)[0]                    # "AAVEUSDT"
-                # UMCBL(USDT-M) 선호, 그 외 suffix도 수용
-                # 이미 값이 있으면 UMCBL을 우선으로 교체
-                if base not in new_index or sym.endswith("_UMCBL"):
-                    new_index[base] = sym
-    else:
-        log.warning("contracts fetch failed: %s %s", c, j)
-
-    if new_index:
-        _contracts_index = new_index
-        _contracts_last_load = now
-        log.info("contracts indexed: %d bases (e.g. AAVEUSDT->%s)", len(_contracts_index),
-                 _contracts_index.get("AAVEUSDT", "N/A"))
+    retries = 3
+    last_err = "unknown"
+    for i in range(retries):
+        idx = _try_build_index_once()
+        if idx:
+            _contracts_index = idx
+            _contracts_last_load = now
+            log.info("contracts indexed: %d bases", len(_contracts_index))
+            return
+        last_err = f"attempt {i+1} failed"
+        time.sleep(0.5 * (i + 1))
+    # still empty
+    log.warning("contracts index build failed (%s). proceeding with fallback path.", last_err)
 
 @app.on_event("startup")
 async def _warmup():
@@ -98,8 +111,18 @@ async def _warmup():
     except Exception:
         log.exception("contracts warmup failed")
 
+# ========= Ticker check (fallback) =========
+def has_ticker(symbol: str) -> bool:
+    c, j = req("GET", "/api/v2/mix/market/ticker", params={"symbol": symbol})
+    if c == 200 and isinstance(j.get("data"), dict):
+        try:
+            return float(j["data"].get("last", 0) or 0) > 0
+        except Exception:
+            return False
+    return False
+
+# ========= Symbol resolver (index + fallback) =========
 def tv_to_base_symbol(tv_symbol: str) -> str:
-    """ 'BINANCE:AAVEUSDT.P' -> 'AAVEUSDT' """
     s = str(tv_symbol).upper().split(":")[-1].strip()
     for suf in (".P", ".PERP", "-PERP"):
         if s.endswith(suf):
@@ -107,13 +130,38 @@ def tv_to_base_symbol(tv_symbol: str) -> str:
     return s
 
 def resolve_tv_symbol(tv_symbol: str) -> Optional[str]:
-    """TV 심볼을 Bitget 실제 심볼로. 인덱스에서 O(1) 조회."""
+    """
+    1) 인덱스에서 즉시 매핑 (있으면 끝)
+    2) 없거나 인덱스가 비었으면, _UMCBL/_DMCBL/_CMCBL 후보에 대해 티커 존재 확인
+    3) (옵션) spot _SPBL도 1회 확인
+    """
     build_contracts_index()
     base = tv_to_base_symbol(tv_symbol)
+
+    # 1) index
     real = _contracts_index.get(base)
     if real:
         return real
-    log.warning("symbol resolve failed for %s (base=%s, indexed=%d)", tv_symbol, base, len(_contracts_index))
+
+    # 2) fallback via ticker
+    tried = []
+    for suf in ("_UMCBL", "_DMCBL", "_CMCBL"):
+        cand = base + suf
+        tried.append(cand)
+        if has_ticker(cand):
+            log.info("resolver fallback via ticker %s -> %s", tv_symbol, cand)
+            return cand
+
+    # 3) optional spot
+    if ALLOW_SPOT_FALLBACK:
+        spot = base + "_SPBL"
+        tried.append(spot)
+        if has_ticker(spot):
+            log.info("resolver spot fallback %s -> %s", tv_symbol, spot)
+            return spot
+
+    log.warning("symbol resolve failed for %s (base=%s, indexed=%d, tried=%s)",
+                tv_symbol, base, len(_contracts_index), tried)
     return None
 
 # ========= Utils =========
@@ -241,7 +289,7 @@ def place_buy(symbol: str) -> Dict[str, Any]:
         return {"ok": False, "reason": "qty<=0", "calc": calc}
 
     body = {
-        "symbol": symbol,                # 반드시 실제 심볼(e.g., AAVEUSDT_UMCBL)
+        "symbol": symbol,
         "marginCoin": MARGIN_COIN,
         "size": str(qty),
         "side": "buy",
@@ -295,10 +343,14 @@ def route_signal(sig: Dict[str, Any]) -> Dict[str, Any]:
 
     return {"ok": False, "reason": f"unknown action {act}"}
 
-# ========= Health =========
+# ========= Health / Debug =========
 @app.get("/healthz")
 async def healthz():
-    return {"ok": True, "v": "TVv7-bitget"}
+    return {"ok": True, "v": "TVv7.2-bitget"}
+
+@app.get("/contractsz")
+async def contractsz():
+    return {"bases": len(_contracts_index), "ttl_sec": CONTRACTS_TTL_SEC, "updated": _contracts_last_load}
 
 # ========= TradingView webhook =========
 @app.post("/tv")
@@ -306,7 +358,7 @@ async def tv(req: Request):
     try:
         raw = (await req.body()).decode("utf-8", "ignore")
         ctype = req.headers.get("content-type", "")
-        log.info("TVv7 recv len=%d ctype=%r", len(raw), ctype)
+        log.info("TVv7.2 recv len=%d ctype=%r", len(raw), ctype)
 
         items = parse_tv_payload(raw)
         accepted, skipped = 0, 0
@@ -314,7 +366,7 @@ async def tv(req: Request):
         now_t = time.time()
 
         for obj in items:
-            log.info("TVv7 ROUTE -> %r", obj)
+            log.info("TVv7.2 ROUTE -> %r", obj)
             act = obj.get("action"); sym = obj.get("symbol")
             if not isinstance(act, str) or not isinstance(sym, str):
                 skipped += 1; results.append({"ok": False, "reason": "invalid object"}); continue
@@ -322,16 +374,16 @@ async def tv(req: Request):
             key = f"{sym}|{act}|{str(obj.get('time',''))}"
             if is_dup(key, now_t):
                 res = {"ok": True, "skipped": "duplicate"}
-                log.info("TVv7 RESULT -> %r", res)
+                log.info("TVv7.2 RESULT -> %r", res)
                 results.append(res); continue
 
             res = route_signal(obj)
-            log.info("TVv7 RESULT -> %r", res)
+            log.info("TVv7.2 RESULT -> %r", res)
             if res.get("ok"): accepted += 1
             else: skipped += 1
             results.append(res)
 
-        return JSONResponse({"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv7-bitget"})
+        return JSONResponse({"ok": True, "accepted": accepted, "skipped": skipped, "items": len(items), "results": results, "v": "TVv7.2-bitget"})
     except Exception:
         log.exception("unhandled /tv")
-        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv7-bitget"})
+        return JSONResponse({"ok": True, "accepted": 0, "items": 0, "err": "unhandled", "v": "TVv7.2-bitget"})
